@@ -1,4 +1,4 @@
-# GrowSense Smart Greenhouse Manager
+# GrowSense Smart Greenhouse Manager - Original Proof of Concept before actual industrial deployment.
 
 A microcontroller-based greenhouse controller that reads temperature, humidity, and ambient light, drives two PWM fans (cooling & heating), a mock RGB "grow light," and provides a button-driven menu on a 16×2 I²C LCD.
 
