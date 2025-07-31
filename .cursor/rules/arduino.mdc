@@ -1,0 +1,176 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# GrowSense Development Roadmap
+
+This README outlines a prioritized, step-by-step list of software and hardware improvements for the GrowSense Smart Greenhouse Manager. Follow each task in sequence—complete one fully before moving on to the next.
+
+---
+
+## Prerequisites
+
+- A working fork of the GrowSense codebase (Arduino sketch + supporting files)
+- Completed current master branch with basic menu, sensors, fans, grow-light, buttons wired, and LCD display working
+- Arduino IDE or CLI setup with all required libraries installed
+- Basic familiarity with C++ (Arduino), EEPROM, and non-blocking millis() patterns
+
+---
+
+## Task 1. Mechanical Debouncing / Switch Guarding
+
+**Goal:** Add hardware filtering so button presses are rock-solid, complementing existing software debounce.
+
+1. On each button line (Up/Down/Left/Right/Select), solder or place on the breadboard:
+   - A **0.1 µF ceramic capacitor** between the button input pin and GND, **or**
+   - An **RC filter** (e.g. 4.7 kΩ + 0.1 µF) in series on the input line.
+2. Verify no missed or spurious presses by observing menu navigation at high speed.
+3. Update wiring diagram accordingly.
+
+---
+
+## Task 2. Non-Blocking Loop / Scheduler
+
+**Goal:** Remove all `delay()` calls; replace with a millis()-based task scheduler so sensors, display, and fan control run in parallel.
+
+1. Create a simple **TaskManager** class or use a lightweight library (e.g. [SimpleScheduler](https://github.com/arkhipenko/SimpleScheduler)):
+   - Register recurring tasks:  
+     - **SensorReadTask** (every 200 ms)  
+     - **DisplayUpdateTask** (every 200 ms)  
+     - **FanControlTask** (every 50 ms)  
+2. Refactor `loop()` to call `scheduler.run()` instead of manual delays.
+3. Remove all existing `delay()` calls.
+4. Test that menu responsiveness, sensor reads, and fan ramps remain smooth.
+
+---
+
+## Task 3. Configuration Persistence
+
+**Goal:** Store user settings (fan speeds, grow-light level, threshold values) in EEPROM so they survive power cycles.
+
+1. Define a **Settings** struct:
+   ```cpp
+   struct Settings {
+     uint8_t coolSpeed;
+     uint8_t heatSpeed;
+     uint8_t growLevel;
+     float   autoCoolThreshold;
+     float   autoHeatThreshold;
+     // … other config …
+   };
+
+	2.	On Select + long-press, write current Settings to EEPROM:
+	•	Use EEPROM.put(address, settings);
+	3.	On startup, read back with EEPROM.get(address, settings);
+	4.	Add a “Reset to Defaults” combo (Select + Up) to clear EEPROM and reload defaults.
+
+⸻
+
+Task 4. PID or Fuzzy Control
+
+Goal: Replace manual 0–3 speed steps with a closed-loop controller that automatically maintains a target temperature or humidity.
+	1.	Integrate an Arduino PID library (e.g. ArduinoPID).
+	2.	Expose two new menu entries under Configuration:
+	•	Set Temp Setpoint
+	•	Set Humidity Setpoint
+	3.	In FanControlTask:
+	•	Compute controlOutput = pid.compute(currentTemp, tempSetpoint);
+	•	Map controlOutput (0–100%) to analogWrite() duty (min tuned for startup).
+	4.	Tune PID gains for stable response (P, I, D values).
+
+⸻
+
+Task 5. Menu Depth & Sub-Menus
+
+Goal: Expand the menu system to include configuration sub-menus for thresholds, PID setpoints, and mode toggles.
+	1.	Refactor menu code to support nested menus:
+
+MAIN  
+  ↳ Show sensors  
+  ↳ COOL MANUAL  
+  ↳ COOL AUTO  
+  ↳ HEAT MANUAL  
+  ↳ HEAT AUTO  
+  ↳ GROW LIGHT  
+  ↳ SETTINGS  
+      ↳ Temp Setpoint  
+      ↳ Humidity Setpoint  
+      ↳ Save & Exit  
+
+
+	2.	Implement Left/Right to adjust values, Up/Down to navigate, Select to enter/exit sub-menus.
+	3.	Ensure that selecting Save & Exit triggers EEPROM write.
+
+⸻
+
+Task 6. Long-Press & Combo Inputs
+
+Goal: Add advanced button interactions for power-user actions (reset, calibration).
+	1.	Enhance isPressed() to detect:
+	•	Long-press (>1 s)
+	•	Multi-button combos (e.g. Up+Select)
+	2.	Use long-press on Select to enter a “Calibration” mode:
+	•	Step through sensor calibrations, show instructions on LCD.
+	3.	Use combo Select+Up to reset all settings to factory defaults.
+
+⸻
+
+Task 7. Wi-Fi / MQTT Integration
+
+Goal: Push real-time sensor and actuator data to an MQTT broker.
+	1.	Add Wi-Fi setup using WiFiNINA (or R4 WiFi library).
+	2.	In NetworkTask:
+	•	Connect to configured SSID/pass
+	•	Publish JSON payloads every 5 s to topics like greensense/sensors and greensense/fans.
+	3.	Add a Network Settings sub-menu to configure SSID, password, broker address.
+
+⸻
+
+Task 8. Web UI
+
+Goal: Host a basic web interface for remote monitoring and control.
+	1.	Use the built-in WiFi web server to serve:
+	•	/ → HTML dashboard showing live values
+	•	/set?cool=2&heat=1&grow=128 → simple control API
+	2.	Create a minimal HTML/JS page with AJAX polling to display sensor data and send control commands.
+	3.	Integrate auth (basic or token-based) to prevent unauthorized access.
+
+⸻
+
+Task 9. Adaptive Brightness / Contrast
+
+Goal: Automatically adjust LCD backlight based on ambient light.
+	1.	Read TSL2591 lux value every loop.
+	2.	Map lux (0–5000) to backlight PWM (0–255).
+	3.	Call lcd.setBacklight(mappedValue) in DisplayUpdateTask.
+
+⸻
+
+Task 10. Custom Characters & Animations
+
+Goal: Improve user feedback with icons and simple animations.
+	1.	Define custom glyphs (e.g. fan, thermometer, water drop) using lcd.createChar().
+	2.	On state changes (e.g. fan turning on), display a quick icon animation in the corner.
+	3.	Use a non-blocking timer to manage frame updates without blocking the main loop.
+
+⸻
+
+Task 11. Brown-Out Detection
+
+Goal: Use hardware brown-out interrupt to persist critical state before undervoltage resets.
+	1.	Enable the MCU’s brown-out detection register (BOD) at ~3.8 V.
+	2.	Attach an ISR to the BOD vector.
+	3.	In the ISR, write current Settings and last sensor readings to EEPROM.
+
+⸻
+
+Final Notes
+	•	Tackle each task fully before moving on.
+	•	Keep version control commits small and focused.
+	•	Review and test thoroughly after each change.
+	•	Document any design decisions or deviations in the project wiki or code comments.
+
+⸻
+
+By following this roadmap, you’ll transform GrowSense into a robust, feature-rich, and maintainable smart greenhouse controller.

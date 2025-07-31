@@ -1,0 +1,1528 @@
+/*
+  GrowSense Smart Greenhouse Manager
+  ----------------------------------
+  Controls a greenhouse environment using:
+    - DHT22 (temperature/humidity)
+    - TSL2591 (ambient light)
+    - Two PWM fans (cooling/heating)
+    - RGB grow light (PWM)
+    - 16x2 I2C LCD (menu, live data)
+    - 5-button D-pad (Up/Down/Left/Right/Select)
+  
+  Features:
+    - Live sensor readout (temp, humidity, light, VPD)
+    - Manual fan and light control
+    - Automatic temperature control via PID
+    - Automatic light level adjustment
+    - Non-blocking task scheduler
+    - Settings persistence in EEPROM
+    - Menu navigation with button combos and long-press
+    - Temperature setpoint adjustment
+  
+  Completed Tasks:
+    - Task 1: Non-Blocking Loop / Scheduler
+    - Task 2: Configuration Persistence
+    - Task 3: PID Control
+    - Task 6: Auto Grow-Light Brightness
+
+  See README.md for wiring, menu, and usage details.
+*/
+
+// ======== Includes ========
+#include <Wire.h>                        // I2C communication
+#include <LiquidCrystal_PCF8574.h>       // I2C LCD library
+#include <Adafruit_Sensor.h>             // Sensor base class
+#include <Adafruit_TSL2591.h>            // Light sensor
+#include <DHT.h>                         // DHT22 temp/humidity
+#include <math.h>                        // For exp()
+#include <EEPROM.h> // For settings persistence
+#include <PID_v1.h> // Arduino PID library
+
+// ======== Pin Definitions ========
+#define DHTPIN       4    // DHT22 data pin
+#define DHTTYPE      DHT22
+
+#define COOL_PIN     9    // Cooling fan (PWM, NPN driver)
+#define HEAT_PIN     10   // Heating fan (PWM, NPN driver)
+
+#define LED_R_PIN    3    // RGB grow-light (Red, PWM)
+#define LED_G_PIN    5    // RGB grow-light (Green, PWM)
+#define LED_B_PIN    6    // RGB grow-light (Blue, PWM)
+
+#define BTN_SELECT   7    // Menu select button
+#define BTN_LEFT     8    // Menu left button
+#define BTN_RIGHT    11   // Menu right button
+#define BTN_UP       12   // Menu up button
+#define BTN_DOWN     13   // Menu down button
+
+// ======== Objects ========
+LiquidCrystal_PCF8574 lcd(0x27);         // LCD at I2C address 0x27
+Adafruit_TSL2591    tsl = Adafruit_TSL2591(2591); // Light sensor
+DHT                dht(DHTPIN, DHTTYPE);         // Temp/humidity sensor
+
+// ======== Menu System ========
+/**
+ * MenuItem: Enumerates the menu screens.
+ *   MI_MAIN: Main sensor readout
+ *   MI_COOL: Cooling fan control
+ *   MI_HEAT: Heating fan control
+ *   MI_GROW: Grow light control
+ *   MI_AUTO: Auto/manual toggle
+ *   MI_SETPOINT: Temperature setpoint adjust
+ *   MI_TARGET_LIGHT: Target light level adjust
+ *   MI_LIGHT_AUTO: Auto light mode toggle
+ *   MI_COUNT: Number of menu items
+ */
+enum MenuItem { MI_MAIN, MI_COOL, MI_HEAT, MI_GROW, MI_AUTO, MI_SETPOINT, MI_TARGET_LIGHT, MI_LIGHT_AUTO, MI_COUNT };
+MenuItem menu = MI_MAIN;  // Current menu state
+
+// ======== Control Variables ========
+int coolSpeed = 0;   // Cooling fan speed (0–3)
+int heatSpeed = 0;   // Heating fan speed (0–3)
+int growLevel = 0;   // Grow light brightness (0–255)
+
+// ======== Button Combo/Long-Press State ========
+bool selectPressed = false;
+bool upPressed = false;
+unsigned long selectPressStart = 0;
+const unsigned long LONG_PRESS_DURATION = 1000; // ms
+
+// ======== Global Timing Variables ========
+unsigned long g_currentMillis = 0; // Global timestamp for this loop
+
+// Task intervals (ms)
+const unsigned long SENSOR_INTERVAL = 200;
+const unsigned long DISPLAY_INTERVAL = 200;
+const unsigned long OUTPUT_INTERVAL = 50;
+const unsigned long PID_INTERVAL = 500;
+const unsigned long LIGHT_CONTROL_INTERVAL = 200;
+const unsigned long CALIBRATION_MODE_INTERVAL = 1000; // 1 second for calibration mode updates
+
+// Last execution times
+unsigned long lastSensorMillis = 0;
+unsigned long lastDisplayMillis = 0;
+unsigned long lastOutputMillis = 0;
+unsigned long lastPIDMillis = 0;
+unsigned long lastLightControlMillis = 0;
+unsigned long lastCalibrationModeMillis = 0;
+
+// ======== Sensor Readings ========
+float g_hum = NAN;
+float g_temp = NAN;
+float g_lux = NAN;
+float g_vpd = NAN;
+
+// ======== Settings Struct & Persistence ========
+#define SETTINGS_VERSION 1
+struct Settings {
+  uint8_t version;
+  uint8_t coolSpeed;
+  uint8_t heatSpeed;
+  uint8_t growLevel;
+  float   autoCoolThreshold;
+  float   autoHeatThreshold;
+  bool    autoMode;
+  double  tempSetpoint;
+  uint16_t targetLight;  // Target light level (lux)
+  bool    lightAutoMode; // Auto light mode flag
+  // Add more config fields as needed
+};
+
+// Start with LED off and lower default target light (200 lux)
+Settings g_settings = {SETTINGS_VERSION, 0, 0, 0, 25.0, 18.0, false, 25.0, 200, false};
+
+// EEPROM address for settings
+const int SETTINGS_ADDR = 0;
+
+// ======== Auto Mode and Light Control Globals ========
+bool autoMode = false; // Single automode: true = automatic, false = manual
+double g_tempSetpoint = 25.0; // °C
+uint16_t g_targetLight = 200; // Target light level in lux (default 200)
+int targetGrowLevel = 0; // Target LED brightness (separated from actual brightness)
+
+// ======== Cooling Startup Logic ========
+bool coolingActive = false;
+int coolingStartupCounter = 0;
+const int COOLING_STARTUP_CYCLES = 10;
+const int COOLING_MIN_PWM = 150;
+bool justEnabledAutoMode = false;
+
+// ======== Heating Startup Logic ========
+bool heatingActive = false;
+int heatingStartupCounter = 0;
+const int HEATING_STARTUP_CYCLES = 10;
+const int HEATING_MIN_PWM = 180; // Higher minimum to ensure immediate startup
+
+// ======== PID Control Variables ========
+// PID input/output/parameters for cooling
+double pidInputCool, pidOutputCool, pidSetpointCool;
+double kpCool = 2.0, kiCool = 5.0, kdCool = 1.0;
+PID pidCool(&pidInputCool, &pidOutputCool, &pidSetpointCool, kpCool, kiCool, kdCool, REVERSE);
+
+// PID input/output/parameters for heating
+double pidInputHeat, pidOutputHeat, pidSetpointHeat;
+double kpHeat = 4.0, kiHeat = 8.0, kdHeat = 1.0; // Increased gains for faster response
+PID pidHeat(&pidInputHeat, &pidOutputHeat, &pidSetpointHeat, kpHeat, kiHeat, kdHeat, DIRECT);
+
+// ======== Auto Light Control Variables ========
+bool lightAutoMode = false; // Auto light mode: true = automatic, false = manual
+const int MAX_ADJUSTMENT_PER_CYCLE = 1; // Reduced back to 1 for more stable control
+const int MAX_LIGHT_BRIGHTNESS = 100; // Further reduced maximum brightness for safety
+const unsigned long LED_DUTY_CYCLE_INTERVAL = 2000; // 2 seconds for duty cycling high brightness
+const unsigned long MIN_ADJUSTMENT_INTERVAL = 500; // Reduced from 1000ms to 500ms for faster response
+int lightPWM = 0; // Current light PWM value (0-255)
+unsigned long lastLightAdjustmentMillis = 0; // Track last time we adjusted brightness
+int g_successiveAdjustments = 0; // Track successive adjustments in same direction
+const int MAX_SUCCESSIVE_ADJUSTMENTS = 5; // Limit successive adjustments for stability
+bool g_lightStartupMode = false; // Whether we're in light startup mode
+unsigned long g_lightStartupBeginMillis = 0; // When light startup mode began
+const unsigned long LIGHT_STARTUP_DURATION = 10000; // 10 seconds for light startup mode
+const unsigned long MIN_ON_TIME = 3000; // Minimum on time for LED to prevent rapid cycling
+unsigned long g_lastLEDOnTime = 0; // When LED was last turned on
+
+// ======== Light Sensor Calibration & Smoothing ========
+const float LIGHT_KP_REDUCED = 0.007; // Reduced from 0.01 for more stable control
+const float LIGHT_KP_LOW_RANGE = 0.003; // Much lower gain for low target ranges (0-500 lux)
+const float LIGHT_KP_MID_RANGE = 0.005; // Medium gain for middle range (500-1500 lux)
+const float LIGHT_KP_HIGH_RANGE = 0.007; // Original gain for high range (1500+ lux)
+const float LIGHT_KI = 0.0001; // Small integral gain to eliminate steady-state error
+const int INITIAL_MAX_BRIGHTNESS = 50; // Lower initial maximum brightness
+const int LIGHT_FILTER_SIZE = 5; // Size of moving average filter
+float g_luxReadings[LIGHT_FILTER_SIZE]; // Array to hold lux readings
+int g_luxFilterIndex = 0; // Current index in the lux readings array
+float g_luxFiltered = 0; // Filtered lux value
+bool g_calibrationMode = false; // Whether we're in calibration mode
+unsigned long g_calibrationStartMillis = 0; // When calibration mode was started
+const unsigned long CALIBRATION_TIMEOUT = 60000; // 1 minute timeout for calibration
+const int INITIAL_AUTO_BRIGHTNESS = 10; // Initial brightness when auto mode is enabled
+const int INITIAL_LOW_TARGET_BRIGHTNESS = 1; // Extremely low initial brightness for low targets
+float g_lightIntegralError = 0.0; // Accumulated error for integral term
+const float MAX_INTEGRAL_ERROR = 5000.0; // Limit integral windup
+const float INTEGRAL_DECAY = 0.95; // Decay factor for integral term to prevent windup
+
+// ======== Menu Extension (Stub for Auto Mode) ========
+// Extend MenuItem enum and menu logic as needed for auto/manual toggle and setpoint adjustment
+// For now, just stubs for future menu expansion
+
+// ======== Function Prototypes ========
+/**
+ * Checks if a button is pressed (debounced).
+ * @param pin Button pin number
+ * @return true if pressed, false otherwise
+ */
+bool isPressed(int pin);
+
+/**
+ * Maps cooling speed (0–3) to PWM value.
+ * @param sp Speed (0–3)
+ * @return PWM value (0–255)
+ */
+int  pwmFromCool(int sp);
+
+/**
+ * Maps heating speed (0–3) to PWM value.
+ * @param sp Speed (0–3)
+ * @return PWM value (0–255)
+ */
+int  pwmFromHeat(int sp);
+
+/**
+ * Loads settings from EEPROM. If version mismatch, loads defaults.
+ */
+void loadSettings();
+
+/**
+ * Saves current settings to EEPROM.
+ */
+void saveSettings();
+
+/**
+ * Resets settings to factory defaults and saves to EEPROM.
+ */
+void resetSettings();
+
+/**
+ * Controls the grow light to maintain target light level with enhanced safety features
+ */
+void updateLightControl();
+
+/**
+ * Updates the calibration mode status and performs necessary actions
+ */
+void updateCalibrationMode();
+
+// ======== PID Task ========
+void updatePID() {
+  // Only calculate PID values - don't apply them
+  // Cooling PID (if enabled)
+  if (autoMode) {
+    pidInputCool = (double)g_temp;
+    pidSetpointCool = g_tempSetpoint;
+    pidCool.Compute();
+  }
+  // Heating PID (if enabled)
+  if (autoMode) {
+    pidInputHeat = (double)g_temp;
+    pidSetpointHeat = g_tempSetpoint;
+    pidHeat.Compute();
+  }
+  // Removed direct pin control - this is now only done in applyOutputs()
+}
+
+// ======== Serial Debug Setup ========
+void setup() {
+  Wire.begin();
+  Serial.begin(9600);
+
+  // IMMEDIATE SAFETY: Turn off all outputs at the very start
+  // before any other initialization
+  pinMode(LED_R_PIN, OUTPUT);
+  pinMode(LED_G_PIN, OUTPUT);
+  pinMode(LED_B_PIN, OUTPUT);
+  pinMode(COOL_PIN, OUTPUT);
+  pinMode(HEAT_PIN, OUTPUT);
+  
+  // Explicitly set all outputs to 0
+  digitalWrite(LED_R_PIN, LOW);
+  digitalWrite(LED_G_PIN, LOW);
+  digitalWrite(LED_B_PIN, LOW);
+  digitalWrite(COOL_PIN, LOW);
+  digitalWrite(HEAT_PIN, LOW);
+  
+  // Double ensure LED is off with analogWrite too
+  analogWrite(LED_R_PIN, 0);
+  analogWrite(LED_G_PIN, 0);
+  analogWrite(LED_B_PIN, 0);
+  analogWrite(COOL_PIN, 0);
+  analogWrite(HEAT_PIN, 0);
+  
+  // Initialize key variables to prevent any chance of undefined behavior
+  growLevel = 0;
+  // Initialize light control variables to ensure they're safe
+  lightPWM = 0;
+  g_lightIntegralError = 0.0;
+  g_lightStartupMode = false;
+  g_lastLEDOnTime = 0;
+  lastLightAdjustmentMillis = 0;
+  g_successiveAdjustments = 0;
+  
+  // LCD initialization
+  lcd.begin(16,2);
+  lcd.setBacklight(255);
+  lcd.clear();
+  lcd.print("GrowSense Init");
+  delay(1000);
+  lcd.clear();
+
+  // DHT22 initialization
+  dht.begin();
+
+  // TSL2591 initialization
+  if (!tsl.begin()) {
+    lcd.print("TSL25911 ERR");
+    while (1); // Halt if sensor not found
+  }
+  // Set gain and integration time for more stable readings
+  tsl.setGain(TSL2591_GAIN_LOW);  // Lower gain for brighter environments
+  tsl.setTiming(TSL2591_INTEGRATIONTIME_300MS);  // Longer integration time for stability
+  
+  // Initialize the light reading filter array
+  for (int i = 0; i < LIGHT_FILTER_SIZE; i++) {
+    g_luxReadings[i] = 0;
+  }
+
+  // Fan and indicator LED outputs
+  pinMode(COOL_PIN, OUTPUT);
+  pinMode(HEAT_PIN, OUTPUT);
+  analogWrite(COOL_PIN, 0);
+  analogWrite(HEAT_PIN, 0);
+
+  // RGB grow-light outputs
+  // Ensure grow light is off at startup
+  analogWrite(LED_R_PIN, 0);
+  analogWrite(LED_G_PIN, 0);
+  analogWrite(LED_B_PIN, 0);
+
+  // Button inputs (active low)
+  pinMode(BTN_SELECT, INPUT_PULLUP);
+  pinMode(BTN_LEFT,   INPUT_PULLUP);
+  pinMode(BTN_RIGHT,  INPUT_PULLUP);
+  pinMode(BTN_UP,     INPUT_PULLUP);
+  pinMode(BTN_DOWN,   INPUT_PULLUP);
+
+  loadSettings(); // Load settings from EEPROM at startup
+
+  // Override any loaded settings for LEDs - always start with LEDs off
+  growLevel = 0;
+  // Initialize targetGrowLevel to 0 to prevent LED from turning on
+  targetGrowLevel = 0;
+
+  // Initialize PIDs with proper settings
+  pidCool.SetMode(AUTOMATIC);
+  pidCool.SetOutputLimits(0, 255);
+  pidCool.SetSampleTime(PID_INTERVAL); // Ensure PID sample time matches our interval
+  
+  pidHeat.SetMode(AUTOMATIC);
+  pidHeat.SetOutputLimits(0, 255);
+  pidHeat.SetSampleTime(PID_INTERVAL); // Ensure PID sample time matches our interval
+  
+  // Initialize PID outputs to zero
+  pidOutputCool = 0;
+  pidOutputHeat = 0;
+
+  coolingActive = false;
+  coolingStartupCounter = 0;
+  heatingActive = false;
+  heatingStartupCounter = 0;
+  justEnabledAutoMode = false;
+  
+  // Initialize light control variables
+  lightPWM = 0; // Start with LED off
+  lastLightControlMillis = 0;
+  lastLightAdjustmentMillis = 0;
+  
+  // Force auto light mode off at startup
+  lightAutoMode = false;
+  
+  // Initialize calibration mode variables
+  g_calibrationMode = false;
+  g_calibrationStartMillis = 0;
+  lastCalibrationModeMillis = 0;
+  
+  // Final safety check - apply all outputs to ensure everything is off
+  applyOutputs();
+  
+  // Log startup
+  Serial.println(F("GrowSense initialized"));
+}
+
+/**
+ * Resets PID controllers to prevent windup during mode transitions.
+ * Call this when switching between heating and cooling.
+ */
+void resetPIDControllers() {
+  // Reset the internal state of both PIDs
+  pidCool.SetMode(MANUAL);
+  pidHeat.SetMode(MANUAL);
+  
+  // Set outputs to zero
+  pidOutputCool = 0;
+  pidOutputHeat = 0;
+  
+  // Re-enable PIDs
+  pidCool.SetMode(AUTOMATIC);
+  pidHeat.SetMode(AUTOMATIC);
+  
+  // When resetting, also reset startup counters
+  coolingStartupCounter = 0;
+  heatingStartupCounter = 0;
+  
+  Serial.println(F("[PID] Controllers reset"));
+}
+
+// ======== Non-blocking Button Debounce ========
+// Simple state-based debounce for each button
+struct ButtonState {
+  bool lastState;
+  unsigned long lastChange;
+};
+ButtonState btnStates[14] = {};
+const unsigned long DEBOUNCE_MS = 30;
+
+bool isPressed(int pin) {
+  bool reading = (digitalRead(pin) == LOW);
+  unsigned long now = millis();
+  ButtonState &state = btnStates[pin];
+  if (reading != state.lastState) {
+    state.lastChange = now;
+    state.lastState = reading;
+  }
+  if (reading && (now - state.lastChange) > DEBOUNCE_MS) {
+    // Only return true once per press
+    state.lastState = false;
+    return true;
+  }
+  return false;
+}
+
+// ======== Enhanced readSensors with Better Filtering ========
+void readSensors() {
+  g_hum  = dht.readHumidity();      // %RH
+  g_temp = dht.readTemperature();  // °C
+
+  uint32_t full = tsl.getFullLuminosity();
+  uint16_t ir  = full >> 16;
+  uint16_t vis = full & 0xFFFF;
+  g_lux    = tsl.calculateLux(vis, ir);
+
+  // Add to moving average filter with improved outlier rejection
+  // Skip extreme values that are likely sensor errors
+  if (!isnan(g_lux) && g_lux >= 0 && g_lux < 100000) { // Basic sanity check
+    g_luxReadings[g_luxFilterIndex] = g_lux;
+    g_luxFilterIndex = (g_luxFilterIndex + 1) % LIGHT_FILTER_SIZE;
+  
+    // Calculate filtered value with improved noise rejection
+    float luxSum = 0;
+    int validReadings = 0;
+    
+    // First pass - calculate average and count valid readings
+    for (int i = 0; i < LIGHT_FILTER_SIZE; i++) {
+      if (!isnan(g_luxReadings[i]) && g_luxReadings[i] >= 0) {
+        luxSum += g_luxReadings[i];
+        validReadings++;
+      }
+    }
+    
+    // Calculate mean for outlier detection
+    float luxMean = (validReadings > 0) ? luxSum / validReadings : g_lux;
+    
+    // Second pass - recalculate without outliers
+    luxSum = 0;
+    int filteredReadings = 0;
+    for (int i = 0; i < LIGHT_FILTER_SIZE; i++) {
+      if (!isnan(g_luxReadings[i]) && g_luxReadings[i] >= 0) {
+        // Exclude readings that differ from mean by more than 40% (reduced from 50%)
+        if (abs(g_luxReadings[i] - luxMean) <= (luxMean * 0.4)) {
+          luxSum += g_luxReadings[i];
+          filteredReadings++;
+        }
+      }
+    }
+    
+    // Use exponential smoothing for even smoother transitions
+    if (filteredReadings > 0) {
+      float newReading = luxSum / filteredReadings;
+      // Apply exponential smoothing: new = alpha * current + (1-alpha) * previous
+      const float alpha = 0.3; // Smoothing factor (lower = smoother, but slower response)
+      g_luxFiltered = (alpha * newReading) + ((1.0 - alpha) * g_luxFiltered);
+    } else if (validReadings > 0) {
+      // Fall back to simple mean with smoothing if all readings were outliers
+      g_luxFiltered = (0.3 * luxMean) + (0.7 * g_luxFiltered);
+    } else {
+      // Fall back to current reading with smoothing if no valid readings
+      g_luxFiltered = (0.3 * g_lux) + (0.7 * g_luxFiltered);
+    }
+  } else {
+    // Bad reading - maintain previous filtered value
+    Serial.println("[SENSORS] Rejected invalid light reading");
+  }
+
+  // Compute VPD (Vapor Pressure Deficit)
+  float es   = 0.6108 * exp((17.27 * g_temp)/(g_temp + 237.3)); // kPa
+  float ea   = es * (g_hum/100.0);                              // kPa
+  g_vpd  = es - ea;                                             // kPa
+
+  // Debug
+  Serial.print("[SENSORS] Temp: "); Serial.print(g_temp);
+  Serial.print(" Set: "); Serial.print(g_tempSetpoint);
+  Serial.print(" Hum: "); Serial.print(g_hum);
+  Serial.print(" Lux: "); Serial.print(g_lux);
+  Serial.print(" LuxFiltered: "); Serial.print(g_luxFiltered);
+  Serial.print(" VPD: "); Serial.println(g_vpd);
+}
+
+// ======== Enhanced handleButtons with Debug ========
+void handleButtons() {
+  // Track button states for combos/long-press
+  bool selectNow = (digitalRead(BTN_SELECT) == LOW);
+  bool upNow = (digitalRead(BTN_UP) == LOW);
+
+  // Detect Select+Up combo for reset
+  if (selectNow && upNow) {
+    resetSettings();
+    // Optionally, show a message on LCD
+    lcd.clear();
+    lcd.print("Factory Reset!");
+    delay(1000);
+    return;
+  }
+
+  // Detect long-press on Select for save
+  if (selectNow && !selectPressed) {
+    selectPressStart = g_currentMillis;
+    selectPressed = true;
+  } else if (!selectNow && selectPressed) {
+    unsigned long pressDuration = g_currentMillis - selectPressStart;
+    if (pressDuration >= LONG_PRESS_DURATION) {
+      // Check if this was a VERY long press (2 seconds or more)
+      if (pressDuration >= LONG_PRESS_DURATION * 2) {
+        // Toggle calibration mode
+        g_calibrationMode = !g_calibrationMode;
+        g_calibrationStartMillis = g_currentMillis;
+        
+        lcd.clear();
+        lcd.print("Calibration Mode");
+        lcd.setCursor(0, 1);
+        lcd.print(g_calibrationMode ? "ENABLED" : "DISABLED");
+        delay(1000);
+        
+        Serial.print("[CALIBRATION] Mode ");
+        Serial.println(g_calibrationMode ? "ENABLED" : "DISABLED");
+        
+        // If disabling, save settings
+        if (!g_calibrationMode) {
+          saveSettings();
+        }
+      } else {
+        // Regular long press (1-2 seconds) - save settings
+        saveSettings();
+        lcd.clear();
+        lcd.print("Settings Saved");
+        delay(1000);
+      }
+    }
+    selectPressed = false;
+  }
+
+  // For grow light adjustments, implement gradual change instead of immediate
+  // targetGrowLevel is now a global variable
+  static unsigned long lastGrowAdjustMillis = 0;
+  
+  // First update the target based on button presses
+  if (!selectNow && !upNow) {
+    if (isPressed(BTN_UP))    { 
+      if (g_calibrationMode) {
+        // In calibration mode, UP increases light by 5
+        lightPWM = min(MAX_LIGHT_BRIGHTNESS, lightPWM + 5);
+        growLevel = lightPWM;
+        Serial.print("[CALIBRATION] Manual PWM increase to: "); Serial.println(lightPWM);
+      } else {
+        menu = MenuItem((menu + MI_COUNT - 1) % MI_COUNT); 
+        Serial.println("BTN_UP pressed"); 
+      }
+    }
+    if (isPressed(BTN_DOWN))  { 
+      if (g_calibrationMode) {
+        // In calibration mode, DOWN decreases light by 5
+        lightPWM = max(0, lightPWM - 5);
+        growLevel = lightPWM;
+        Serial.print("[CALIBRATION] Manual PWM decrease to: "); Serial.println(lightPWM);
+      } else {
+        menu = MenuItem((menu + 1) % MI_COUNT); 
+        Serial.println("BTN_DOWN pressed"); 
+      }
+    }
+    if (isPressed(BTN_LEFT)) {
+      Serial.print("BTN_LEFT pressed, menu: "); Serial.println(menu);
+      if (g_calibrationMode) {
+        // In calibration mode, LEFT decreases target light by 50
+        g_targetLight = max(0, g_targetLight - 50);
+        Serial.print("[CALIBRATION] Target decreased to: "); Serial.println(g_targetLight);
+      } else {
+        switch(menu) {
+          case MI_COOL: coolSpeed = max(0, coolSpeed - 1); break;
+          case MI_HEAT: heatSpeed = max(0, heatSpeed - 1); break;
+          case MI_GROW: targetGrowLevel = max(0, targetGrowLevel - 1); break; // Update target only
+          case MI_AUTO: autoMode = false; break;
+          case MI_SETPOINT: g_tempSetpoint = max(10.0, g_tempSetpoint - 0.5); break;
+          case MI_TARGET_LIGHT: g_targetLight = max(0, g_targetLight - 50); break;
+          case MI_LIGHT_AUTO: lightAutoMode = false; break;
+          default: break;
+        }
+      }
+    }
+    if (isPressed(BTN_RIGHT)) {
+      Serial.print("BTN_RIGHT pressed, menu: "); Serial.println(menu);
+      if (g_calibrationMode) {
+        // In calibration mode, RIGHT increases target light by 50
+        g_targetLight = min(5000, g_targetLight + 50);
+        Serial.print("[CALIBRATION] Target increased to: "); Serial.println(g_targetLight);
+      } else {
+        switch(menu) {
+          case MI_COOL: coolSpeed = min(3, coolSpeed + 1); break;
+          case MI_HEAT: heatSpeed = min(3, heatSpeed + 1); break;
+          case MI_GROW: targetGrowLevel = min(MAX_LIGHT_BRIGHTNESS, targetGrowLevel + 1); break; // Update target only
+          case MI_AUTO: autoMode = true; break;
+          case MI_SETPOINT: g_tempSetpoint = min(40.0, g_tempSetpoint + 0.5); break;
+          case MI_TARGET_LIGHT: g_targetLight = min(5000, g_targetLight + 50); break;
+          case MI_LIGHT_AUTO: lightAutoMode = true; break;
+          default: break;
+        }
+      }
+    }
+    if (isPressed(BTN_SELECT)) {
+      if (g_calibrationMode) {
+        // In calibration mode, SELECT toggles auto light mode
+        lightAutoMode = !lightAutoMode;
+        Serial.print("[CALIBRATION] Auto light mode: ");
+        Serial.println(lightAutoMode ? "ON" : "OFF");
+        
+        lcd.clear();
+        lcd.print("Auto Light Mode:");
+        lcd.setCursor(0, 1);
+        lcd.print(lightAutoMode ? "ON" : "OFF");
+        delay(1000);
+      } else {
+        menu = MI_MAIN;
+        Serial.println("BTN_SELECT pressed");
+      }
+    }
+  }
+  
+  // Then gradually move current level toward target (but only in manual mode)
+  if (!lightAutoMode && g_currentMillis - lastGrowAdjustMillis >= 250) { // Adjust every 250ms
+    if (growLevel < targetGrowLevel) {
+      growLevel++;
+      Serial.print("[GROW] Increasing to: "); Serial.println(growLevel);
+    } else if (growLevel > targetGrowLevel) {
+      growLevel--;
+      Serial.print("[GROW] Decreasing to: "); Serial.println(growLevel);
+    }
+    lastGrowAdjustMillis = g_currentMillis;
+  }
+
+  static bool lastAutoMode = false;
+  // After handling button presses, check for autoMode toggle
+  if (autoMode != lastAutoMode) {
+    // Reset cooling startup state and set justEnabledAutoMode when switching auto/manual
+    coolingActive = false;
+    coolingStartupCounter = 0;
+    justEnabledAutoMode = autoMode; // Set true only when switching to auto
+    lastAutoMode = autoMode;
+  }
+  
+  // Track changes in lightAutoMode
+  static bool lastLightAutoMode = false;
+  if (lightAutoMode != lastLightAutoMode) {
+    Serial.print("[LIGHT AUTO] Mode changed to: ");
+    Serial.println(lightAutoMode ? "AUTO" : "MANUAL");
+    
+    // If switching to auto mode, initialize lightPWM with a starting value
+    if (lightAutoMode) {
+      // Determine initial brightness based on target light level
+      int initialBrightness;
+      
+      // For very low targets, use a much lower initial brightness
+      if (g_targetLight < 300) {
+        initialBrightness = INITIAL_LOW_TARGET_BRIGHTNESS;
+        Serial.println("[LIGHT AUTO] Using very low initial brightness for low target");
+      } else if (g_targetLight < 1000) {
+        // Scale initial brightness based on target for medium targets
+        initialBrightness = map(g_targetLight, 300, 1000, 5, INITIAL_AUTO_BRIGHTNESS);
+      } else {
+        // Use standard initial brightness for higher targets
+        initialBrightness = INITIAL_AUTO_BRIGHTNESS;
+      }
+      
+      // If current light is below target, give it the calculated initial boost
+      if (g_luxFiltered < g_targetLight) {
+        lightPWM = initialBrightness;
+        growLevel = lightPWM;
+        Serial.print("[LIGHT AUTO] Initial PWM set to: ");
+        Serial.println(initialBrightness);
+      } else {
+        // Otherwise, start from a lower value than current level to prevent overshooting
+        lightPWM = min(growLevel, initialBrightness);
+        Serial.print("[LIGHT AUTO] Initial PWM set to minimum of current and initial: ");
+        Serial.println(lightPWM);
+      }
+      
+      // Reset integral error at startup to prevent accumulated error issues
+      g_lightIntegralError = 0;
+      
+      // Force an immediate adjustment
+      lastLightAdjustmentMillis = g_currentMillis - MIN_ADJUSTMENT_INTERVAL - 1;
+    }
+    
+    lastLightAutoMode = lightAutoMode;
+  }
+}
+
+// ======== Enhanced applyOutputs with Debug and NaN check ========
+void applyOutputs() {
+  if (autoMode) {
+    // If automode was just enabled, skip this cycle and reset all outputs/state
+    if (justEnabledAutoMode) {
+      analogWrite(COOL_PIN, 0);
+      analogWrite(HEAT_PIN, 0);
+      resetPIDControllers();  // Reset PID controllers when enabling auto mode
+      coolingActive = false;
+      coolingStartupCounter = 0;
+      heatingActive = false;
+      heatingStartupCounter = 0;
+      Serial.println("[AUTO] First cycle after enabling automode: all outputs reset");
+      justEnabledAutoMode = false;
+      return;
+    }
+    if (isnan(g_temp)) {
+      Serial.println("[AUTO] Temp is NaN, skipping PID");
+      analogWrite(COOL_PIN, 0);
+      analogWrite(HEAT_PIN, 0);
+      pidOutputCool = 0;
+      pidOutputHeat = 0;
+      coolingActive = false;
+      coolingStartupCounter = 0;
+      heatingActive = false;
+      heatingStartupCounter = 0;
+      return;
+    }
+    
+    // Track current mode to detect transitions
+    static bool wasCooling = false;
+    static bool wasHeating = false;
+    
+    double error = g_tempSetpoint - g_temp;
+    Serial.print("[AUTO] Current error: "); Serial.println(error);
+    
+    if (error < -0.2) { // Too hot, cool
+      // Mode transition: heating -> cooling
+      if (wasHeating) {
+        Serial.println("[AUTO] Mode transition: heating -> cooling");
+        resetPIDControllers();  // Reset PID controllers during mode transition
+        wasHeating = false;
+        
+        // Exiting heating mode
+        heatingActive = false;
+        heatingStartupCounter = 0;
+      }
+      
+      // Only trigger cooling startup logic if actually cooling and not just switched from another mode
+      if (!coolingActive) {
+        coolingActive = true;
+        coolingStartupCounter = 0;
+        Serial.println("[COOL] Entering cooling mode, forcing min PWM for startup");
+      }
+      
+      wasCooling = true;
+      
+      // PID already calculated in updatePID()
+      int pwm = constrain((int)pidOutputCool, 0, 255);
+      // Force min PWM for first few cycles
+      if (coolingStartupCounter < COOLING_STARTUP_CYCLES) {
+        pwm = COOLING_MIN_PWM;
+        coolingStartupCounter++;
+        Serial.print("[COOL] Startup cycle "); Serial.print(coolingStartupCounter); Serial.print(" forcing PWM="); Serial.println(pwm);
+      } else if (pwm > 0 && pwm < COOLING_MIN_PWM) {
+        pwm = COOLING_MIN_PWM;
+      }
+      analogWrite(COOL_PIN, pwm);
+      analogWrite(HEAT_PIN, 0);
+      Serial.print("[AUTO] COOL: temp="); Serial.print(g_temp); Serial.print(" set="); Serial.print(g_tempSetpoint); Serial.print(" error="); Serial.print(error); Serial.print(" pwm="); Serial.println(pwm);
+    } else if (error > 0.2) { // Too cold, heat
+      // Mode transition: cooling -> heating
+      if (wasCooling) {
+        Serial.println("[AUTO] Mode transition: cooling -> heating");
+        resetPIDControllers();  // Reset PID controllers during mode transition
+        wasCooling = false;
+        
+        // Exiting cooling mode
+        coolingActive = false;
+        coolingStartupCounter = 0;
+      }
+      
+      // Only trigger heating startup logic if not already heating
+      if (!heatingActive) {
+        heatingActive = true;
+        heatingStartupCounter = 0;
+        Serial.println("[HEAT] Entering heating mode, forcing min PWM for startup");
+      }
+      
+      wasHeating = true;
+      
+      // PID already calculated in updatePID()
+      int pwm = constrain((int)pidOutputHeat, 0, 255);
+      
+      // Force min PWM for first few cycles to ensure immediate startup
+      if (heatingStartupCounter < HEATING_STARTUP_CYCLES) {
+        pwm = HEATING_MIN_PWM;
+        heatingStartupCounter++;
+        Serial.print("[HEAT] Startup cycle "); Serial.print(heatingStartupCounter); Serial.print(" forcing PWM="); Serial.println(pwm);
+      } else if (pwm > 0 && pwm < HEATING_MIN_PWM) {
+        pwm = HEATING_MIN_PWM;
+      }
+      
+      analogWrite(HEAT_PIN, pwm);
+      analogWrite(COOL_PIN, 0);
+      Serial.print("[AUTO] HEAT: temp="); Serial.print(g_temp); Serial.print(" set="); Serial.print(g_tempSetpoint); Serial.print(" error="); Serial.print(error); Serial.print(" pwm="); Serial.println(pwm);
+    } else {
+      // In range (deadband): both off, both PID outputs zeroed
+      if (coolingActive) {
+        coolingActive = false;
+        coolingStartupCounter = 0;
+      }
+      if (heatingActive) {
+        heatingActive = false;
+        heatingStartupCounter = 0;
+      }
+      wasCooling = false;
+      wasHeating = false;
+      analogWrite(COOL_PIN, 0);
+      analogWrite(HEAT_PIN, 0);
+      pidOutputCool = 0;
+      pidOutputHeat = 0;
+      Serial.println("[AUTO] IN RANGE: both off");
+    }
+  } else {
+    coolingActive = false;
+    coolingStartupCounter = 0;
+    heatingActive = false;
+    heatingStartupCounter = 0;
+    justEnabledAutoMode = false;
+    analogWrite(COOL_PIN, pwmFromCool(coolSpeed));
+    analogWrite(HEAT_PIN, pwmFromHeat(heatSpeed));
+    Serial.print("[MANUAL] COOL: "); Serial.print(coolSpeed); Serial.print(" HEAT: "); Serial.println(heatSpeed);
+  }
+
+  // Startup safety: Skip first few seconds to ensure everything is stable
+  static bool startupSafety = true;
+  static unsigned long startupSafetyTimer = 0;
+  
+  if (startupSafety) {
+    if (startupSafetyTimer == 0) {
+      startupSafetyTimer = g_currentMillis;
+      // Keep LEDs off during startup safety period
+      analogWrite(LED_R_PIN, 0);
+      analogWrite(LED_G_PIN, 0);
+      analogWrite(LED_B_PIN, 0);
+      Serial.println("[SAFETY] LED startup safety active, keeping LEDs off");
+      return;
+    }
+    
+    // Keep LEDs off for the first 5 seconds
+    if (g_currentMillis - startupSafetyTimer < 5000) {
+      // Keep LEDs off during startup safety period
+      analogWrite(LED_R_PIN, 0);
+      analogWrite(LED_G_PIN, 0);
+      analogWrite(LED_B_PIN, 0);
+      return;
+    } else {
+      startupSafety = false;
+      Serial.println("[SAFETY] LED startup safety period complete");
+    }
+  }
+
+  // Only apply manual grow light setting if not in auto light mode
+  if (!lightAutoMode) {
+    // Apply duty cycling for higher brightness levels to prevent overheating
+    if (growLevel > 0) {
+      // Safety check - disable LED in extremely humid conditions to prevent condensation issues
+      if (!isnan(g_hum) && g_hum > 95.0) {
+        // Too humid - disable LED for safety
+        analogWrite(LED_R_PIN, 0);
+        analogWrite(LED_G_PIN, 0);
+        analogWrite(LED_B_PIN, 0);
+        Serial.println("[LIGHT] SAFETY: Humidity too high, LED disabled");
+        return;
+      }
+      
+      // If brightness is high, implement duty cycling
+      if (growLevel > 50) {
+        // For high brightness, use duty cycling to reduce heat
+        // Turn LED on/off based on a cycle to reduce average power
+        unsigned long cyclePosition = g_currentMillis % LED_DUTY_CYCLE_INTERVAL;
+        unsigned long onThreshold = (LED_DUTY_CYCLE_INTERVAL * 7) / 10; // 70% on time
+        
+        if (cyclePosition < onThreshold) {
+          analogWrite(LED_R_PIN, growLevel);
+          analogWrite(LED_G_PIN, growLevel);
+          analogWrite(LED_B_PIN, growLevel);
+        } else {
+          // Cooling period - reduce to 30% brightness
+          int reducedLevel = (growLevel * 3) / 10; // 30% of original brightness
+          analogWrite(LED_R_PIN, reducedLevel);
+          analogWrite(LED_G_PIN, reducedLevel);
+          analogWrite(LED_B_PIN, reducedLevel);
+        }
+      } else {
+        // For low brightness, direct output is safe
+        analogWrite(LED_R_PIN, growLevel);
+        analogWrite(LED_G_PIN, growLevel);
+        analogWrite(LED_B_PIN, growLevel);
+      }
+    } else {
+      // LED off
+      analogWrite(LED_R_PIN, 0);
+      analogWrite(LED_G_PIN, 0);
+      analogWrite(LED_B_PIN, 0);
+    }
+    Serial.print("[MANUAL LIGHT] Level: "); Serial.println(growLevel);
+  } else {
+    // In auto mode, the updateLightControl function already set growLevel
+    // with safety limits applied
+    // Apply duty cycling for higher brightness levels to prevent overheating
+    if (growLevel > 0) {
+      // Safety check - disable LED in extremely humid conditions to prevent condensation issues
+      if (!isnan(g_hum) && g_hum > 95.0) {
+        // Too humid - disable LED for safety
+        analogWrite(LED_R_PIN, 0);
+        analogWrite(LED_G_PIN, 0);
+        analogWrite(LED_B_PIN, 0);
+        Serial.println("[LIGHT] SAFETY: Humidity too high, LED disabled");
+        return;
+      }
+      
+      // If brightness is high, implement duty cycling
+      if (growLevel > 50) {
+        // For high brightness, use duty cycling to reduce heat
+        // Turn LED on/off based on a cycle to reduce average power
+        unsigned long cyclePosition = g_currentMillis % LED_DUTY_CYCLE_INTERVAL;
+        unsigned long onThreshold = (LED_DUTY_CYCLE_INTERVAL * 7) / 10; // 70% on time
+        
+        if (cyclePosition < onThreshold) {
+          analogWrite(LED_R_PIN, growLevel);
+          analogWrite(LED_G_PIN, growLevel);
+          analogWrite(LED_B_PIN, growLevel);
+        } else {
+          // Cooling period - reduce to 30% brightness
+          int reducedLevel = (growLevel * 3) / 10; // 30% of original brightness
+          analogWrite(LED_R_PIN, reducedLevel);
+          analogWrite(LED_G_PIN, reducedLevel);
+          analogWrite(LED_B_PIN, reducedLevel);
+        }
+      } else {
+        // For low brightness, direct output is safe
+        analogWrite(LED_R_PIN, growLevel);
+        analogWrite(LED_G_PIN, growLevel);
+        analogWrite(LED_B_PIN, growLevel);
+      }
+    } else {
+      // LED off
+      analogWrite(LED_R_PIN, 0);
+      analogWrite(LED_G_PIN, 0);
+      analogWrite(LED_B_PIN, 0);
+    }
+    Serial.print("[AUTO LIGHT] Level: "); Serial.println(growLevel);
+  }
+}
+
+/**
+ * Updates the LCD display based on the current menu.
+ */
+void updateDisplay() {
+  lcd.clear();
+
+  // If in calibration mode, override normal display
+  if (g_calibrationMode) {
+    lcd.print("CAL - LUX:");
+    lcd.print((int)g_luxFiltered);
+    
+    lcd.setCursor(0, 1);
+    lcd.print("TGT:");
+    lcd.print(g_targetLight);
+    lcd.print(" PWM:");
+    lcd.print(lightPWM);
+    return;
+  }
+  
+  // Regular menu display
+  switch(menu) {
+    case MI_MAIN:
+      // Line 1: Temp & Humidity
+      if (isnan(g_temp) || isnan(g_hum)) {
+        lcd.print("DHT Err");
+      } else {
+        lcd.print("T:"); lcd.print(g_temp,1);
+        lcd.write(0xDF); lcd.print("C H:");
+        lcd.print(g_hum,1); lcd.print("%");
+      }
+      // Line 2: Lux & VPD
+      lcd.setCursor(0,1);
+      lcd.print("L:"); lcd.print((int)g_lux);
+      lcd.print(" V:"); lcd.print(g_vpd,2);
+      break;
+
+    case MI_COOL:
+      lcd.print("> COOL: "); lcd.print(coolSpeed);
+      lcd.setCursor(0,1);
+      lcd.print("  HEAT: "); lcd.print(heatSpeed);
+      break;
+
+    case MI_HEAT:
+      lcd.print("  COOL: "); lcd.print(coolSpeed);
+      lcd.setCursor(0,1);
+      lcd.print("> HEAT: "); lcd.print(heatSpeed);
+      break;
+
+    case MI_GROW:
+      lcd.print("  COOL: "); lcd.print(coolSpeed);
+      lcd.setCursor(0,1);
+      lcd.print("> GROW: "); lcd.print(growLevel);
+      break;
+
+    case MI_AUTO:
+      lcd.print("AUTO MODE: ");
+      lcd.print(autoMode ? "ON" : "OFF");
+      lcd.setCursor(0,1);
+      lcd.print("<L/R> Toggle");
+      break;
+
+    case MI_SETPOINT:
+      lcd.print("TEMP SET: ");
+      lcd.print(g_tempSetpoint,1); lcd.print((char)223); lcd.print("C");
+      lcd.setCursor(0,1);
+      lcd.print("<L/R> Adj");
+      break;
+
+    case MI_TARGET_LIGHT:
+      lcd.print("TARGET LIGHT:");
+      lcd.setCursor(0,1);
+      lcd.print(g_targetLight);
+      lcd.print(" lux <L/R>");
+      break;
+
+    case MI_LIGHT_AUTO:
+      lcd.print("LIGHT AUTO: ");
+      lcd.print(lightAutoMode ? "ON" : "OFF");
+      lcd.setCursor(0,1);
+      lcd.print("<L/R> Toggle");
+      break;
+  }
+}
+
+/**
+ * Updates the calibration mode status and performs necessary actions
+ */
+void updateCalibrationMode() {
+  // Skip if not in calibration mode
+  if (!g_calibrationMode) {
+    return;
+  }
+  
+  // Check for timeout
+  if (g_currentMillis - g_calibrationStartMillis >= CALIBRATION_TIMEOUT) {
+    g_calibrationMode = false;
+    lcd.clear();
+    lcd.print("Calibration Mode");
+    lcd.setCursor(0, 1);
+    lcd.print("TIMEOUT - OFF");
+    delay(1000);
+    
+    Serial.println("[CALIBRATION] Mode TIMEOUT - DISABLED");
+    
+    // Save settings
+    saveSettings();
+    return;
+  }
+  
+  // Every 5 seconds, show calibration status
+  if ((g_currentMillis - g_calibrationStartMillis) % 5000 < 50) {
+    Serial.println("[CALIBRATION] Test Protocol:");
+    Serial.print("  Light Level: "); Serial.println(g_luxFiltered);
+    Serial.print("  Light Target: "); Serial.println(g_targetLight);
+    Serial.print("  Light PWM: "); Serial.println(lightPWM);
+    Serial.print("  Light Error: "); Serial.println(g_targetLight - g_luxFiltered);
+    Serial.print("  Time Remaining: "); Serial.print((CALIBRATION_TIMEOUT - (g_currentMillis - g_calibrationStartMillis)) / 1000); Serial.println(" seconds");
+  }
+}
+
+// ======== Refactored Main Loop with Scheduler ========
+void loop() {
+  g_currentMillis = millis();
+
+  // 1) Handle buttons every loop (responsive)
+  handleButtons();
+
+  // 2) Schedule sensor reading
+  if (g_currentMillis - lastSensorMillis >= SENSOR_INTERVAL) {
+    readSensors();
+    lastSensorMillis += SENSOR_INTERVAL;
+  }
+
+  // 3) Schedule output control
+  if (g_currentMillis - lastOutputMillis >= OUTPUT_INTERVAL) {
+    applyOutputs();
+    lastOutputMillis += OUTPUT_INTERVAL;
+  }
+
+  // 4) Schedule display update
+  if (g_currentMillis - lastDisplayMillis >= DISPLAY_INTERVAL) {
+    updateDisplay();
+    lastDisplayMillis += DISPLAY_INTERVAL;
+  }
+
+  // Schedule PID update
+  if (g_currentMillis - lastPIDMillis >= PID_INTERVAL) {
+    updatePID();
+    lastPIDMillis += PID_INTERVAL;
+  }
+
+  // Schedule light control
+  if (g_currentMillis - lastLightControlMillis >= LIGHT_CONTROL_INTERVAL) {
+    updateLightControl();
+    lastLightControlMillis += LIGHT_CONTROL_INTERVAL;
+  }
+
+  // Schedule calibration mode update
+  if (g_currentMillis - lastCalibrationModeMillis >= CALIBRATION_MODE_INTERVAL) {
+    updateCalibrationMode();
+    lastCalibrationModeMillis += CALIBRATION_MODE_INTERVAL;
+  }
+
+  // No delay() anywhere: loop is always non-blocking
+}
+
+// ======== PWM Mapping ========
+/**
+ * Maps cooling speed (0–3) to PWM: 0→0, 1→180, 2→217, 3→255
+ */
+int pwmFromCool(int sp) {
+  if (sp == 0) return 0;
+  return map(sp, 1, 3, 180, 255);
+}
+
+/**
+ * Maps heating speed (0–3) to PWM: 0→100, 1→100, 2→177, 3→255
+ */
+int pwmFromHeat(int sp) {
+  if (sp == 0) return 0;
+  return map(sp, 1, 3, 100, 255);
+}
+
+/**
+ * Loads settings from EEPROM. If version mismatch, loads defaults.
+ */
+void loadSettings() {
+  EEPROM.get(SETTINGS_ADDR, g_settings);
+  if (g_settings.version != SETTINGS_VERSION) {
+    // Version mismatch or uninitialized, load defaults
+    g_settings = {SETTINGS_VERSION, 0, 0, 0, 25.0, 18.0, false, 25.0, 200, false};
+    EEPROM.put(SETTINGS_ADDR, g_settings);
+  }
+  // Apply loaded settings to control variables
+  coolSpeed = g_settings.coolSpeed;
+  heatSpeed = g_settings.heatSpeed;
+  // Start with LED off regardless of saved setting
+  growLevel = 0;
+  autoMode = g_settings.autoMode;
+  g_tempSetpoint = g_settings.tempSetpoint;
+  g_targetLight = g_settings.targetLight;
+  lightAutoMode = g_settings.lightAutoMode;
+  // targetGrowLevel is set to 0 in setup() to ensure LED is off at startup
+  
+  // Initialize light control variables to ensure they're safe
+  lightPWM = 0;
+  g_lightIntegralError = 0.0;
+  g_lightStartupMode = false;
+  g_lastLEDOnTime = 0;
+  
+  // Log the loaded settings
+  Serial.println(F("[SETTINGS] Loaded from EEPROM"));
+  Serial.print(F("[SETTINGS] Target light: ")); Serial.println(g_targetLight);
+}
+
+/**
+ * Saves current settings to EEPROM.
+ */
+void saveSettings() {
+  g_settings.version = SETTINGS_VERSION;
+  g_settings.coolSpeed = coolSpeed;
+  g_settings.heatSpeed = heatSpeed;
+  g_settings.growLevel = growLevel;
+  g_settings.autoMode = autoMode;
+  g_settings.tempSetpoint = g_tempSetpoint;
+  g_settings.targetLight = g_targetLight;
+  g_settings.lightAutoMode = lightAutoMode;
+  EEPROM.put(SETTINGS_ADDR, g_settings);
+}
+
+/**
+ * Resets settings to factory defaults and saves to EEPROM.
+ */
+void resetSettings() {
+  g_settings = {SETTINGS_VERSION, 0, 0, 0, 25.0, 18.0, false, 25.0, 200, false};
+  EEPROM.put(SETTINGS_ADDR, g_settings);
+  coolSpeed = g_settings.coolSpeed;
+  heatSpeed = g_settings.heatSpeed;
+  growLevel = g_settings.growLevel;
+  autoMode = g_settings.autoMode;
+  g_tempSetpoint = g_settings.tempSetpoint;
+  g_targetLight = g_settings.targetLight;
+  lightAutoMode = g_settings.lightAutoMode;
+  
+  // Log the reset
+  Serial.println(F("[SETTINGS] Factory reset"));
+  Serial.print(F("[SETTINGS] Target light: ")); Serial.println(g_targetLight);
+}
+
+/**
+ * Controls the grow light to maintain target light level with enhanced safety features
+ */
+void updateLightControl() {
+  // Skip if auto light mode is off or if lux reading is invalid
+  if (!lightAutoMode || isnan(g_luxFiltered)) {
+    return;
+  }
+  
+  // If target is very low (below 50 lux), turn light off completely
+  if (g_targetLight < 50) {
+    lightPWM = 0;
+    growLevel = 0;
+    g_lightIntegralError = 0; // Reset integral error
+    g_successiveAdjustments = 0; // Reset successive adjustments counter
+    Serial.println("[LIGHT] Target too low, turning light off");
+    return;
+  }
+  
+  // Temperature-based safety: if ambient temperature is high, limit LED brightness
+  // This prevents LED burnout during high ambient temperatures
+  float tempSafetyFactor = 1.0;
+  if (!isnan(g_temp)) {
+    if (g_temp > 30.0) {
+      // Start reducing brightness above 30°C
+      int mapValue = map((int)(g_temp * 10), 300, 400, 100, 50);
+      tempSafetyFactor = constrain(mapValue, 50, 100) / 100.0;
+      Serial.print("[LIGHT] Temperature safety factor: "); Serial.println(tempSafetyFactor);
+      
+      // Force off at very high temperatures
+      if (g_temp > 40.0) {
+        lightPWM = 0;
+        growLevel = 0;
+        g_lightIntegralError = 0; // Reset integral error
+        g_successiveAdjustments = 0; // Reset successive adjustments counter
+        Serial.println("[LIGHT] SAFETY: Temperature too high, turning light off");
+        return;
+      }
+    }
+  }
+  
+  // Check if we need to enter light startup mode for low targets
+  static bool wasLightOn = false;
+  if (g_targetLight < 500 && !g_lightStartupMode && lightPWM == 0 && wasLightOn == false) {
+    // We need to start from zero with a very slow step-up process
+    g_lightStartupMode = true;
+    g_lightStartupBeginMillis = g_currentMillis;
+    lightPWM = 1; // Start with minimum brightness
+    growLevel = lightPWM;
+    wasLightOn = true;
+    g_lastLEDOnTime = g_currentMillis;
+    Serial.println("[LIGHT] Entering low-target startup mode with PWM=1");
+  }
+  
+  // Only adjust light every MIN_ADJUSTMENT_INTERVAL ms to prevent rapid changes
+  if (g_currentMillis - lastLightAdjustmentMillis < MIN_ADJUSTMENT_INTERVAL) {
+    return;
+  }
+  
+  // Special handling for startup mode (slow ramp-up)
+  if (g_lightStartupMode) {
+    // Check if we should exit startup mode (after duration or if we reach target)
+    if (g_currentMillis - g_lightStartupBeginMillis > LIGHT_STARTUP_DURATION ||
+        g_luxFiltered >= g_targetLight * 0.9) {
+      g_lightStartupMode = false;
+      Serial.print("[LIGHT] Exiting startup mode. Current lux: ");
+      Serial.print(g_luxFiltered);
+      Serial.print(" Target: ");
+      Serial.println(g_targetLight);
+    } else {
+      // Very slow step-up every 1 second, but only if we're below target
+      if (g_currentMillis - lastLightAdjustmentMillis >= 1000 && g_luxFiltered < g_targetLight * 0.8) {
+        int previousPWM = lightPWM;
+        
+        // Increment very carefully for low targets
+        if (g_targetLight < 300) {
+          lightPWM += (lightPWM < 3) ? 1 : 0; // Max PWM 3 for very low targets during startup
+        } else if (g_targetLight < 800) {
+          lightPWM += (lightPWM < 5) ? 1 : 0; // Max PWM 5 for low targets during startup
+        } else {
+          lightPWM += (lightPWM < 8) ? 1 : 0; // Max PWM 8 for medium targets during startup
+        }
+        
+        growLevel = lightPWM;
+        lastLightAdjustmentMillis = g_currentMillis;
+        
+        Serial.print("[LIGHT] Startup step-up PWM: ");
+        Serial.print(previousPWM);
+        Serial.print(" -> ");
+        Serial.print(lightPWM);
+        Serial.print(" | Lux: ");
+        Serial.println(g_luxFiltered);
+      }
+      return; // Skip regular control during startup mode
+    }
+  }
+  
+  // Calculate error (target - current)
+  float error = g_targetLight - g_luxFiltered;
+  
+  // Calculate deadband based on target level - wider deadband for low targets
+  float deadbandPercent = 0.05; // Default 5%
+  if (g_targetLight < 500) {
+    // Even wider deadband for very low targets (15%)
+    deadbandPercent = 0.15;
+  } else if (g_targetLight < 1500) {
+    // Medium deadband for medium targets (8%)
+    deadbandPercent = 0.08;
+  }
+  
+  float deadbandThreshold = g_targetLight * deadbandPercent;
+  
+  // If light is on, use wider deadband for turning off (additional 5%)
+  float offThreshold = (lightPWM > 0) ? deadbandThreshold * 1.5 : deadbandThreshold;
+  
+  // If we're close enough to target, decay integral error and make no adjustments
+  if (abs(error) < deadbandThreshold) {
+    // Within deadband - decay integral error
+    g_lightIntegralError *= INTEGRAL_DECAY;
+    g_successiveAdjustments = 0; // Reset successive adjustments counter
+    
+    Serial.print("[LIGHT] Within deadband (±"); 
+    Serial.print(deadbandThreshold);
+    Serial.println(" lux) - no adjustment");
+    return;
+  }
+  
+  // Update integral error with anti-windup
+  // For very low targets, use lower integral gain to prevent oscillation
+  float effectiveKI = LIGHT_KI;
+  if (g_targetLight < 300) {
+    effectiveKI *= 0.3; // Reduce integral gain by 70% for low targets
+  } else if (g_targetLight < 800) {
+    effectiveKI *= 0.5; // Reduce integral gain by 50% for medium-low targets
+  }
+  
+  g_lightIntegralError += error * (MIN_ADJUSTMENT_INTERVAL / 1000.0); // Scale by time in seconds
+  g_lightIntegralError = constrain(g_lightIntegralError, -MAX_INTEGRAL_ERROR, MAX_INTEGRAL_ERROR);
+  
+  // Select appropriate proportional gain based on target range
+  float kp;
+  if (g_targetLight < 500) {
+    kp = LIGHT_KP_LOW_RANGE;
+    // For very low targets, further reduce proportional gain
+    if (g_targetLight < 300) {
+      kp *= 0.7; // 30% reduction for very low targets
+    }
+  } else if (g_targetLight < 1500) {
+    kp = LIGHT_KP_MID_RANGE;
+  } else {
+    kp = LIGHT_KP_HIGH_RANGE;
+  }
+  
+  // Further reduce gain for calibration mode for more stable testing
+  if (g_calibrationMode) {
+    kp *= 0.8;
+  }
+  
+  // PI control with variable gains based on target range
+  float pTerm = kp * error;
+  float iTerm = effectiveKI * g_lightIntegralError;
+  
+  // Calculate adjustment with proportional and integral terms
+  float rawAdjustment = pTerm + iTerm;
+  
+  // For very large errors, add boost but with exponential dampening to prevent massive overshoots
+  // Only apply boost for positive errors (too dark) for safety
+  if (error > 200) {
+    // Log scale boost factor that increases with error but with diminishing returns
+    float boostFactor = 1.0 + log10(error / 100.0);
+    // Limit boost for very small light levels to prevent overcompensation
+    if (g_targetLight < 500) {
+      boostFactor = min(boostFactor, 1.2); // Further reduced from 1.5 to 1.2
+    }
+    rawAdjustment *= boostFactor;
+    Serial.print("[LIGHT] Large error boost factor: "); Serial.println(boostFactor);
+  }
+  
+  // For very low targets with positive error (too dark), be more conservative
+  if (g_targetLight < 300 && error > 0) {
+    // Use smaller adjustments when increasing brightness for low targets
+    rawAdjustment *= 0.5; // Reduced from 0.7 to 0.5 for even more caution
+    Serial.println("[LIGHT] Low target conservative increase");
+  }
+  
+  // For negative errors (too bright), be more aggressive with low targets
+  if (error < 0 && g_targetLight < 300 && abs(error) > g_targetLight * 0.3) {
+    // Amplify reduction for low targets that are significantly too bright
+    rawAdjustment *= 1.5; 
+    Serial.println("[LIGHT] Low target aggressive decrease");
+  }
+  
+  // Limit the maximum adjustment per cycle for smoother transitions
+  int adjustment = constrain((int)rawAdjustment, -MAX_ADJUSTMENT_PER_CYCLE, MAX_ADJUSTMENT_PER_CYCLE);
+  
+  // Skip tiny adjustments to prevent unnecessary cycling
+  if (adjustment == 0) {
+    return;
+  }
+  
+  // Check minimum on time to prevent rapid cycling
+  if (lightPWM > 0 && adjustment < 0 && g_currentMillis - g_lastLEDOnTime < MIN_ON_TIME) {
+    Serial.println("[LIGHT] Enforcing minimum on time - skipping reduction");
+    return;
+  }
+  
+  // Track successive adjustments in the same direction
+  static int lastAdjustmentDirection = 0;
+  int currentDirection = (adjustment > 0) ? 1 : -1;
+  
+  if (currentDirection == lastAdjustmentDirection) {
+    g_successiveAdjustments++;
+    
+    // If too many successive adjustments in same direction, dampen the response
+    if (g_successiveAdjustments > MAX_SUCCESSIVE_ADJUSTMENTS) {
+      // Reduce adjustment magnitude
+      adjustment = adjustment / 2;
+      
+      // If adjustment becomes zero due to integer division, force minimum change
+      if (adjustment == 0) {
+        adjustment = currentDirection;
+      }
+      
+      Serial.println("[LIGHT] Dampening adjustment due to successive changes");
+    }
+  } else {
+    // Reset counter when direction changes
+    g_successiveAdjustments = 0;
+  }
+  lastAdjustmentDirection = currentDirection;
+  
+  // Store previous value to detect significant changes
+  int previousPWM = lightPWM;
+  
+  // Update the light PWM value with cap on maximum brightness
+  int safeMaxBrightness = g_calibrationMode ? MAX_LIGHT_BRIGHTNESS : INITIAL_MAX_BRIGHTNESS;
+  safeMaxBrightness = (int)(safeMaxBrightness * tempSafetyFactor);
+  
+  // Limit maximum brightness for low targets
+  if (g_targetLight < 300) {
+    safeMaxBrightness = min(safeMaxBrightness, 15); // Cap at PWM 15 for very low targets
+  } else if (g_targetLight < 800) {
+    safeMaxBrightness = min(safeMaxBrightness, 25); // Cap at PWM 25 for low-medium targets
+  }
+  
+  // Special handling for very low lux targets to prevent overshooting
+  if (g_targetLight < 300 && error < 0 && abs(error) > g_targetLight * 0.5) {
+    // If we're significantly overshooting a low target, make a larger reduction
+    lightPWM = max(0, lightPWM - 2);
+    Serial.println("[LIGHT] Low target overshoot correction");
+  } else if (lightPWM > 0 && lightPWM + adjustment <= 0 && error > -deadbandThreshold * 3) {
+    // If we're already active and adjustment would make us turn off, enforce a minimum
+    // Only apply minimum if we're not drastically over the target
+    lightPWM = 1; // Reduced minimum brightness level from 2 to 1
+    Serial.println("[LIGHT] Enforcing minimum brightness");
+  } else {
+    // Normal adjustment
+    lightPWM = constrain(lightPWM + adjustment, 0, safeMaxBrightness);
+  }
+  
+  // If we're turning on from off state, record the time
+  if (previousPWM == 0 && lightPWM > 0) {
+    g_lastLEDOnTime = g_currentMillis;
+    Serial.println("[LIGHT] LED turning on, recording timestamp");
+    
+    // For low targets, force starting at PWM=1 to prevent overshoot
+    if (g_targetLight < 500) {
+      lightPWM = 1;
+      Serial.println("[LIGHT] Low target, forcing initial PWM=1");
+    }
+  }
+  
+  // Track LED state for startup mode detection
+  wasLightOn = (lightPWM > 0);
+  
+  // Apply the new PWM value to all RGB channels
+  // Note: The actual output will be applied in applyOutputs()
+  growLevel = lightPWM;
+  
+  // If we made an adjustment, update the timestamp
+  if (previousPWM != lightPWM) {
+    lastLightAdjustmentMillis = g_currentMillis;
+    
+    Serial.print("[LIGHT] Target: "); Serial.print(g_targetLight);
+    Serial.print(" Current: "); Serial.print(g_luxFiltered);
+    Serial.print(" Error: "); Serial.print(error);
+    Serial.print(" P-term: "); Serial.print(pTerm);
+    Serial.print(" I-term: "); Serial.print(iTerm);
+    Serial.print(" Adjustment: "); Serial.print(adjustment);
+    Serial.print(" PWM: "); Serial.println(lightPWM);
+  }
+}

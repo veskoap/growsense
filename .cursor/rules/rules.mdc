@@ -1,0 +1,67 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+0. Ingest Project Overview
+   - Read and parse [readme.md](mdc:readme.md) and [todo.md](mdc:todo.md) before any changes.
+
+1. General Coding & Style
+   - unsigned long for millis()
+   - Prefix pins TASK_, PIN_, globals g_
+   - Single-responsibility functions
+   - No magic numbers
+
+2. Task Scheduling (Non-Blocking Loop)
+   - millis()-based scheduler
+   -reviousMillis by interval
+   - Single global timestamp g_currentMillis
+
+3. Configuration Persistence
+   - EEPROM struct must include version, autoMode, tempSetpoint, autoCoolThreshold, autoHeatThreshold, targetLight
+   - Use EEPROM.put/get with versioning/CRC
+   - Select+Up long-press resets EEPROM
+
+4. Closed-Loop PID Control
+   - Use Arduino-PID-Library
+   - Schedule PID updates every 500 ms
+   - Clamp outputs with minimum startup PWM
+   - Handle heating vs cooling transitions
+   - Ensure immediate startup logic
+
+5. Menu Depth & Navigation
+   - Build menu tree matching updated todo.md, including “Target Light Level”
+   - Up/Down navigate, Left/Right adjust, Select enter/exit
+   - Save & Exit writes EEPROM
+
+6. Long-Press & Combo Inputs
+   - FSM per button: IDLE→DEBOUNCE→PRESSED→LONG_PRESSED→RELEASED
+   - Long-press Select enters Calibration
+   - Select+Up resets to defaults
+
+7. Auto Grow-Light Brightness
+   - Expose “Target Light Level” in SETTINGS, stored in EEPROM
+   - Every 200 ms: read current lux, compute error to target
+   - Use a proportional (or PID) loop to adjust RGB LED PWM
+   - Clamp brightness 0–255, test and tune gain
+
+8. Custom Characters & Animations
+   - Define up to 8 glyphs via lcd.createChar()
+   - Schedule animations non-blocking
+
+9. Brown-Out Detection & Safety
+   - Enable BOD at ~3.8 V
+   - BOD ISR persists Settings + last readings
+   - Enable hardware watchdog
+
+10. Wi-Fi & MQTT Integration
+   - Non-blocking reconnect logic
+   - Publish JSON every 5 s
+   - Securely store network creds in EEPROM
+
+11. Web UI
+   - Async endpoints `/status.json`, `/control`
+   - Minimal HTML/JS client with AJAX
+   - Basic auth or token-based security
+
+— Execute rules **0 → 11** in order. Each change must be verified against the updated [todo.md](mdc:todo.md)  and [readme.md](mdc:readme.md) before proceeding.  

@@ -1,0 +1,668 @@
+/*
+  GrowSense Smart Greenhouse Manager
+  ----------------------------------
+  Controls a greenhouse environment using:
+    - DHT22 (temperature/humidity)
+    - TSL2591 (ambient light)
+    - Two PWM fans (cooling/heating)
+    - RGB grow light (PWM)
+    - 16x2 I2C LCD (menu, live data)
+    - 5-button D-pad (Up/Down/Left/Right/Select)
+  
+  Features:
+    - Live sensor readout
+    - Manual fan and light control
+    - Menu navigation
+    - (Planned: non-blocking scheduler, EEPROM settings, PID control, etc.)
+  
+  See README.md for wiring, menu, and usage details.
+*/
+
+// ======== Includes ========
+#include <Wire.h>                        // I2C communication
+#include <LiquidCrystal_PCF8574.h>       // I2C LCD library
+#include <Adafruit_Sensor.h>             // Sensor base class
+#include <Adafruit_TSL2591.h>            // Light sensor
+#include <DHT.h>                         // DHT22 temp/humidity
+#include <math.h>                        // For exp()
+#include <EEPROM.h> // For settings persistence
+#include <PID_v1.h> // Arduino PID library
+
+// ======== Pin Definitions ========
+#define DHTPIN       4    // DHT22 data pin
+#define DHTTYPE      DHT22
+
+#define COOL_PIN     9    // Cooling fan (PWM, NPN driver)
+#define HEAT_PIN     10   // Heating fan (PWM, NPN driver)
+
+#define LED_R_PIN    3    // RGB grow-light (Red, PWM)
+#define LED_G_PIN    5    // RGB grow-light (Green, PWM)
+#define LED_B_PIN    6    // RGB grow-light (Blue, PWM)
+
+#define BTN_SELECT   7    // Menu select button
+#define BTN_LEFT     8    // Menu left button
+#define BTN_RIGHT    11   // Menu right button
+#define BTN_UP       12   // Menu up button
+#define BTN_DOWN     13   // Menu down button
+
+// ======== Objects ========
+LiquidCrystal_PCF8574 lcd(0x27);         // LCD at I2C address 0x27
+Adafruit_TSL2591    tsl = Adafruit_TSL2591(2591); // Light sensor
+DHT                dht(DHTPIN, DHTTYPE);         // Temp/humidity sensor
+
+// ======== Menu System ========
+/**
+ * MenuItem: Enumerates the menu screens.
+ *   MI_MAIN: Main sensor readout
+ *   MI_COOL: Cooling fan control
+ *   MI_HEAT: Heating fan control
+ *   MI_GROW: Grow light control
+ *   MI_AUTO: Auto/manual toggle
+ *   MI_SETPOINT: Temperature setpoint adjust
+ *   MI_COUNT: Number of menu items
+ */
+enum MenuItem { MI_MAIN, MI_COOL, MI_HEAT, MI_GROW, MI_AUTO, MI_SETPOINT, MI_COUNT };
+MenuItem menu = MI_MAIN;  // Current menu state
+
+// ======== Control Variables ========
+int coolSpeed = 0;   // Cooling fan speed (0–3)
+int heatSpeed = 0;   // Heating fan speed (0–3)
+int growLevel = 0;   // Grow light brightness (0–255)
+
+// ======== Button Combo/Long-Press State ========
+bool selectPressed = false;
+bool upPressed = false;
+unsigned long selectPressStart = 0;
+const unsigned long LONG_PRESS_DURATION = 1000; // ms
+
+// ======== Global Timing Variables ========
+unsigned long g_currentMillis = 0; // Global timestamp for this loop
+
+// Task intervals (ms)
+const unsigned long SENSOR_INTERVAL = 200;
+const unsigned long DISPLAY_INTERVAL = 200;
+const unsigned long OUTPUT_INTERVAL = 50;
+
+// Last execution times
+unsigned long lastSensorMillis = 0;
+unsigned long lastDisplayMillis = 0;
+unsigned long lastOutputMillis = 0;
+
+// ======== Sensor Readings ========
+float g_hum = NAN;
+float g_temp = NAN;
+float g_lux = NAN;
+float g_vpd = NAN;
+
+// ======== Settings Struct & Persistence ========
+#define SETTINGS_VERSION 1
+struct Settings {
+  uint8_t version;
+  uint8_t coolSpeed;
+  uint8_t heatSpeed;
+  uint8_t growLevel;
+  float   autoCoolThreshold;
+  float   autoHeatThreshold;
+  bool    autoMode;
+  double  tempSetpoint;
+  // Add more config fields as needed
+};
+
+Settings g_settings = {SETTINGS_VERSION, 0, 0, 0, 25.0, 18.0, false, 25.0}; // Defaults
+
+// EEPROM address for settings
+const int SETTINGS_ADDR = 0;
+
+// ======== Auto Mode and Setpoint Globals ========
+bool autoMode = false; // Single automode: true = automatic, false = manual
+double g_tempSetpoint = 25.0; // °C
+
+// ======== Cooling Startup Logic ========
+bool coolingActive = false;
+int coolingStartupCounter = 0;
+const int COOLING_STARTUP_CYCLES = 10;
+const int COOLING_MIN_PWM = 150;
+bool justEnabledAutoMode = false;
+
+// ======== PID Control Variables ========
+// PID input/output/parameters for cooling
+double pidInputCool, pidOutputCool, pidSetpointCool;
+double kpCool = 2.0, kiCool = 5.0, kdCool = 1.0;
+PID pidCool(&pidInputCool, &pidOutputCool, &pidSetpointCool, kpCool, kiCool, kdCool, REVERSE);
+
+// PID input/output/parameters for heating
+double pidInputHeat, pidOutputHeat, pidSetpointHeat;
+double kpHeat = 2.0, kiHeat = 5.0, kdHeat = 1.0;
+PID pidHeat(&pidInputHeat, &pidOutputHeat, &pidSetpointHeat, kpHeat, kiHeat, kdHeat, DIRECT);
+
+// PID update interval
+const unsigned long PID_INTERVAL = 500;
+unsigned long lastPIDMillis = 0;
+
+// ======== Menu Extension (Stub for Auto Mode) ========
+// Extend MenuItem enum and menu logic as needed for auto/manual toggle and setpoint adjustment
+// For now, just stubs for future menu expansion
+
+// ======== Function Prototypes ========
+/**
+ * Checks if a button is pressed (debounced).
+ * @param pin Button pin number
+ * @return true if pressed, false otherwise
+ */
+bool isPressed(int pin);
+
+/**
+ * Maps cooling speed (0–3) to PWM value.
+ * @param sp Speed (0–3)
+ * @return PWM value (0–255)
+ */
+int  pwmFromCool(int sp);
+
+/**
+ * Maps heating speed (0–3) to PWM value.
+ * @param sp Speed (0–3)
+ * @return PWM value (0–255)
+ */
+int  pwmFromHeat(int sp);
+
+/**
+ * Loads settings from EEPROM. If version mismatch, loads defaults.
+ */
+void loadSettings();
+
+/**
+ * Saves current settings to EEPROM.
+ */
+void saveSettings();
+
+/**
+ * Resets settings to factory defaults and saves to EEPROM.
+ */
+void resetSettings();
+
+// ======== PID Task ========
+void updatePID() {
+  // Only calculate PID values - don't apply them
+  // Cooling PID (if enabled)
+  if (autoMode) {
+    pidInputCool = (double)g_temp;
+    pidSetpointCool = g_tempSetpoint;
+    pidCool.Compute();
+  }
+  // Heating PID (if enabled)
+  if (autoMode) {
+    pidInputHeat = (double)g_temp;
+    pidSetpointHeat = g_tempSetpoint;
+    pidHeat.Compute();
+  }
+  // Removed direct pin control - this is now only done in applyOutputs()
+}
+
+// ======== Serial Debug Setup ========
+void setup() {
+  Wire.begin();
+  Serial.begin(9600);
+
+  // LCD initialization
+  lcd.begin(16,2);
+  lcd.setBacklight(255);
+  lcd.clear();
+  lcd.print("GrowSense Init");
+  delay(1000);
+  lcd.clear();
+
+  // DHT22 initialization
+  dht.begin();
+
+  // TSL2591 initialization
+  if (!tsl.begin()) {
+    lcd.print("TSL25911 ERR");
+    while (1); // Halt if sensor not found
+  }
+  // Set gain and integration time for faster updates
+  tsl.setGain(TSL2591_GAIN_MED);
+  tsl.setTiming(TSL2591_INTEGRATIONTIME_100MS);
+
+  // Fan and indicator LED outputs
+  pinMode(COOL_PIN, OUTPUT);
+  pinMode(HEAT_PIN, OUTPUT);
+  analogWrite(COOL_PIN, 0);
+  analogWrite(HEAT_PIN, 0);
+
+  // RGB grow-light outputs
+  pinMode(LED_R_PIN, OUTPUT);
+  pinMode(LED_G_PIN, OUTPUT);
+  pinMode(LED_B_PIN, OUTPUT);
+  analogWrite(LED_R_PIN, 0);
+  analogWrite(LED_G_PIN, 0);
+  analogWrite(LED_B_PIN, 0);
+
+  // Button inputs (active low)
+  pinMode(BTN_SELECT, INPUT_PULLUP);
+  pinMode(BTN_LEFT,   INPUT_PULLUP);
+  pinMode(BTN_RIGHT,  INPUT_PULLUP);
+  pinMode(BTN_UP,     INPUT_PULLUP);
+  pinMode(BTN_DOWN,   INPUT_PULLUP);
+
+  loadSettings(); // Load settings from EEPROM at startup
+
+  // Initialize PIDs with proper settings
+  pidCool.SetMode(AUTOMATIC);
+  pidCool.SetOutputLimits(0, 255);
+  pidCool.SetSampleTime(PID_INTERVAL); // Ensure PID sample time matches our interval
+  
+  pidHeat.SetMode(AUTOMATIC);
+  pidHeat.SetOutputLimits(0, 255);
+  pidHeat.SetSampleTime(PID_INTERVAL); // Ensure PID sample time matches our interval
+  
+  // Initialize PID outputs to zero
+  pidOutputCool = 0;
+  pidOutputHeat = 0;
+
+  coolingActive = false;
+  coolingStartupCounter = 0;
+  justEnabledAutoMode = false;
+  
+  // Log startup
+  Serial.println(F("GrowSense initialized"));
+}
+
+/**
+ * Resets PID controllers to prevent windup during mode transitions.
+ * Call this when switching between heating and cooling.
+ */
+void resetPIDControllers() {
+  // Reset the internal state of both PIDs
+  pidCool.SetMode(MANUAL);
+  pidHeat.SetMode(MANUAL);
+  
+  // Set outputs to zero
+  pidOutputCool = 0;
+  pidOutputHeat = 0;
+  
+  // Re-enable PIDs
+  pidCool.SetMode(AUTOMATIC);
+  pidHeat.SetMode(AUTOMATIC);
+  
+  Serial.println(F("[PID] Controllers reset"));
+}
+
+// ======== Non-blocking Button Debounce ========
+// Simple state-based debounce for each button
+struct ButtonState {
+  bool lastState;
+  unsigned long lastChange;
+};
+ButtonState btnStates[14] = {};
+const unsigned long DEBOUNCE_MS = 30;
+
+bool isPressed(int pin) {
+  bool reading = (digitalRead(pin) == LOW);
+  unsigned long now = millis();
+  ButtonState &state = btnStates[pin];
+  if (reading != state.lastState) {
+    state.lastChange = now;
+    state.lastState = reading;
+  }
+  if (reading && (now - state.lastChange) > DEBOUNCE_MS) {
+    // Only return true once per press
+    state.lastState = false;
+    return true;
+  }
+  return false;
+}
+
+// ======== Enhanced readSensors with Debug ========
+void readSensors() {
+  g_hum  = dht.readHumidity();      // %RH
+  g_temp = dht.readTemperature();  // °C
+
+  uint32_t full = tsl.getFullLuminosity();
+  uint16_t ir  = full >> 16;
+  uint16_t vis = full & 0xFFFF;
+  g_lux    = tsl.calculateLux(vis, ir);
+
+  // Compute VPD (Vapor Pressure Deficit)
+  float es   = 0.6108 * exp((17.27 * g_temp)/(g_temp + 237.3)); // kPa
+  float ea   = es * (g_hum/100.0);                              // kPa
+  g_vpd  = es - ea;                                             // kPa
+
+  // Debug
+  Serial.print("[SENSORS] Temp: "); Serial.print(g_temp);
+  Serial.print(" Set: "); Serial.print(g_tempSetpoint);
+  Serial.print(" Hum: "); Serial.print(g_hum);
+  Serial.print(" Lux: "); Serial.print(g_lux);
+  Serial.print(" VPD: "); Serial.println(g_vpd);
+}
+
+// ======== Enhanced handleButtons with Debug ========
+void handleButtons() {
+  // Track button states for combos/long-press
+  bool selectNow = (digitalRead(BTN_SELECT) == LOW);
+  bool upNow = (digitalRead(BTN_UP) == LOW);
+
+  // Detect Select+Up combo for reset
+  if (selectNow && upNow) {
+    resetSettings();
+    // Optionally, show a message on LCD
+    lcd.clear();
+    lcd.print("Factory Reset!");
+    delay(1000);
+    return;
+  }
+
+  // Detect long-press on Select for save
+  if (selectNow && !selectPressed) {
+    selectPressStart = g_currentMillis;
+    selectPressed = true;
+  } else if (!selectNow && selectPressed) {
+    unsigned long pressDuration = g_currentMillis - selectPressStart;
+    if (pressDuration >= LONG_PRESS_DURATION) {
+      saveSettings();
+      lcd.clear();
+      lcd.print("Settings Saved");
+      delay(1000);
+    }
+    selectPressed = false;
+  }
+
+  // Standard button handling (only if not in combo/long-press)
+  if (!selectNow && !upNow) {
+    if (isPressed(BTN_UP))    { menu = MenuItem((menu + MI_COUNT - 1) % MI_COUNT); Serial.println("BTN_UP pressed"); }
+    if (isPressed(BTN_DOWN))  { menu = MenuItem((menu + 1) % MI_COUNT); Serial.println("BTN_DOWN pressed"); }
+    if (isPressed(BTN_LEFT)) {
+      Serial.print("BTN_LEFT pressed, menu: "); Serial.println(menu);
+      switch(menu) {
+        case MI_COOL: coolSpeed = max(0, coolSpeed - 1); break;
+        case MI_HEAT: heatSpeed = max(0, heatSpeed - 1); break;
+        case MI_GROW: growLevel = max(0, growLevel - 5); break;
+        case MI_AUTO: autoMode = false; break;
+        case MI_SETPOINT: g_tempSetpoint = max(10.0, g_tempSetpoint - 0.5); break;
+        default: break;
+      }
+    }
+    if (isPressed(BTN_RIGHT)) {
+      Serial.print("BTN_RIGHT pressed, menu: "); Serial.println(menu);
+      switch(menu) {
+        case MI_COOL: coolSpeed = min(3, coolSpeed + 1); break;
+        case MI_HEAT: heatSpeed = min(3, heatSpeed + 1); break;
+        case MI_GROW: growLevel = min(255, growLevel + 5); break;
+        case MI_AUTO: autoMode = true; break;
+        case MI_SETPOINT: g_tempSetpoint = min(40.0, g_tempSetpoint + 0.5); break;
+        default: break;
+      }
+    }
+    if (isPressed(BTN_SELECT)) {
+      menu = MI_MAIN;
+      Serial.println("BTN_SELECT pressed");
+    }
+  }
+
+  static bool lastAutoMode = false;
+  // After handling button presses, check for autoMode toggle
+  if (autoMode != lastAutoMode) {
+    // Reset cooling startup state and set justEnabledAutoMode when switching auto/manual
+    coolingActive = false;
+    coolingStartupCounter = 0;
+    justEnabledAutoMode = autoMode; // Set true only when switching to auto
+    lastAutoMode = autoMode;
+  }
+}
+
+// ======== Enhanced applyOutputs with Debug and NaN check ========
+void applyOutputs() {
+  if (autoMode) {
+    // If automode was just enabled, skip this cycle and reset all outputs/state
+    if (justEnabledAutoMode) {
+      analogWrite(COOL_PIN, 0);
+      analogWrite(HEAT_PIN, 0);
+      resetPIDControllers();  // Reset PID controllers when enabling auto mode
+      coolingActive = false;
+      coolingStartupCounter = 0;
+      Serial.println("[AUTO] First cycle after enabling automode: all outputs reset");
+      justEnabledAutoMode = false;
+      return;
+    }
+    if (isnan(g_temp)) {
+      Serial.println("[AUTO] Temp is NaN, skipping PID");
+      analogWrite(COOL_PIN, 0);
+      analogWrite(HEAT_PIN, 0);
+      pidOutputCool = 0;
+      pidOutputHeat = 0;
+      coolingActive = false;
+      coolingStartupCounter = 0;
+      return;
+    }
+    
+    // Track current mode to detect transitions
+    static bool wasCooling = false;
+    static bool wasHeating = false;
+    
+    double error = g_tempSetpoint - g_temp;
+    Serial.print("[AUTO] Current error: "); Serial.println(error);
+    
+    if (error < -0.2) { // Too hot, cool
+      // Mode transition: heating -> cooling
+      if (wasHeating) {
+        Serial.println("[AUTO] Mode transition: heating -> cooling");
+        resetPIDControllers();  // Reset PID controllers during mode transition
+        wasHeating = false;
+      }
+      
+      // Only trigger cooling startup logic if actually cooling and not just switched from another mode
+      if (!coolingActive) {
+        coolingActive = true;
+        coolingStartupCounter = 0;
+        Serial.println("[COOL] Entering cooling mode, forcing min PWM for startup");
+      }
+      
+      wasCooling = true;
+      
+      // PID already calculated in updatePID()
+      int pwm = constrain((int)pidOutputCool, 0, 255);
+      // Force min PWM for first few cycles
+      if (coolingStartupCounter < COOLING_STARTUP_CYCLES) {
+        pwm = COOLING_MIN_PWM;
+        coolingStartupCounter++;
+        Serial.print("[COOL] Startup cycle "); Serial.print(coolingStartupCounter); Serial.print(" forcing PWM="); Serial.println(pwm);
+      } else if (pwm > 0 && pwm < COOLING_MIN_PWM) {
+        pwm = COOLING_MIN_PWM;
+      }
+      analogWrite(COOL_PIN, pwm);
+      analogWrite(HEAT_PIN, 0);
+      Serial.print("[AUTO] COOL: temp="); Serial.print(g_temp); Serial.print(" set="); Serial.print(g_tempSetpoint); Serial.print(" error="); Serial.print(error); Serial.print(" pwm="); Serial.println(pwm);
+    } else if (error > 0.2) { // Too cold, heat
+      // Mode transition: cooling -> heating
+      if (wasCooling) {
+        Serial.println("[AUTO] Mode transition: cooling -> heating");
+        resetPIDControllers();  // Reset PID controllers during mode transition
+        wasCooling = false;
+        
+        // Exiting cooling mode
+        coolingActive = false;
+        coolingStartupCounter = 0;
+      }
+      
+      wasHeating = true;
+      
+      // PID already calculated in updatePID()
+      int pwm = constrain((int)pidOutputHeat, 0, 255);
+      if (pwm > 0 && pwm < 80) pwm = 80; // Lowered for testing
+      analogWrite(HEAT_PIN, pwm);
+      analogWrite(COOL_PIN, 0);
+      Serial.print("[AUTO] HEAT: temp="); Serial.print(g_temp); Serial.print(" set="); Serial.print(g_tempSetpoint); Serial.print(" error="); Serial.print(error); Serial.print(" pwm="); Serial.println(pwm);
+    } else {
+      // In range (deadband): both off, both PID outputs zeroed
+      if (coolingActive) {
+        coolingActive = false;
+        coolingStartupCounter = 0;
+      }
+      wasCooling = false;
+      wasHeating = false;
+      analogWrite(COOL_PIN, 0);
+      analogWrite(HEAT_PIN, 0);
+      pidOutputCool = 0;
+      pidOutputHeat = 0;
+      Serial.println("[AUTO] IN RANGE: both off");
+    }
+  } else {
+    coolingActive = false;
+    coolingStartupCounter = 0;
+    justEnabledAutoMode = false;
+    analogWrite(COOL_PIN, pwmFromCool(coolSpeed));
+    analogWrite(HEAT_PIN, pwmFromHeat(heatSpeed));
+    Serial.print("[MANUAL] COOL: "); Serial.print(coolSpeed); Serial.print(" HEAT: "); Serial.println(heatSpeed);
+  }
+  analogWrite(LED_R_PIN, growLevel);
+  analogWrite(LED_G_PIN, growLevel);
+  analogWrite(LED_B_PIN, growLevel);
+}
+
+/**
+ * Updates the LCD display based on the current menu.
+ */
+void updateDisplay() {
+  lcd.clear();
+  switch(menu) {
+    case MI_MAIN:
+      // Line 1: Temp & Humidity
+      if (isnan(g_temp) || isnan(g_hum)) {
+        lcd.print("DHT Err");
+      } else {
+        lcd.print("T:"); lcd.print(g_temp,1);
+        lcd.write(0xDF); lcd.print("C H:");
+        lcd.print(g_hum,1); lcd.print("%");
+      }
+      // Line 2: Lux & VPD
+      lcd.setCursor(0,1);
+      lcd.print("L:"); lcd.print((int)g_lux);
+      lcd.print(" V:"); lcd.print(g_vpd,2);
+      break;
+
+    case MI_COOL:
+      lcd.print("> COOL: "); lcd.print(coolSpeed);
+      lcd.setCursor(0,1);
+      lcd.print("  HEAT: "); lcd.print(heatSpeed);
+      break;
+
+    case MI_HEAT:
+      lcd.print("  COOL: "); lcd.print(coolSpeed);
+      lcd.setCursor(0,1);
+      lcd.print("> HEAT: "); lcd.print(heatSpeed);
+      break;
+
+    case MI_GROW:
+      lcd.print("  COOL: "); lcd.print(coolSpeed);
+      lcd.setCursor(0,1);
+      lcd.print("> GROW: "); lcd.print(growLevel);
+      break;
+
+    case MI_AUTO:
+      lcd.print("AUTO MODE: ");
+      lcd.print(autoMode ? "ON" : "OFF");
+      lcd.setCursor(0,1);
+      lcd.print("<L/R> Toggle");
+      break;
+
+    case MI_SETPOINT:
+      lcd.print("TEMP SET: ");
+      lcd.print(g_tempSetpoint,1); lcd.print((char)223); lcd.print("C");
+      lcd.setCursor(0,1);
+      lcd.print("<L/R> Adj");
+      break;
+  }
+}
+
+// ======== Refactored Main Loop with Scheduler ========
+void loop() {
+  g_currentMillis = millis();
+
+  // 1) Handle buttons every loop (responsive)
+  handleButtons();
+
+  // 2) Schedule sensor reading
+  if (g_currentMillis - lastSensorMillis >= SENSOR_INTERVAL) {
+    readSensors();
+    lastSensorMillis += SENSOR_INTERVAL;
+  }
+
+  // 3) Schedule output control
+  if (g_currentMillis - lastOutputMillis >= OUTPUT_INTERVAL) {
+    applyOutputs();
+    lastOutputMillis += OUTPUT_INTERVAL;
+  }
+
+  // 4) Schedule display update
+  if (g_currentMillis - lastDisplayMillis >= DISPLAY_INTERVAL) {
+    updateDisplay();
+    lastDisplayMillis += DISPLAY_INTERVAL;
+  }
+
+  // Schedule PID update
+  if (g_currentMillis - lastPIDMillis >= PID_INTERVAL) {
+    updatePID();
+    lastPIDMillis += PID_INTERVAL;
+  }
+  // No delay() anywhere: loop is always non-blocking
+}
+
+// ======== PWM Mapping ========
+/**
+ * Maps cooling speed (0–3) to PWM: 0→0, 1→180, 2→217, 3→255
+ */
+int pwmFromCool(int sp) {
+  if (sp == 0) return 0;
+  return map(sp, 1, 3, 180, 255);
+}
+
+/**
+ * Maps heating speed (0–3) to PWM: 0→100, 1→100, 2→177, 3→255
+ */
+int pwmFromHeat(int sp) {
+  if (sp == 0) return 0;
+  return map(sp, 1, 3, 100, 255);
+}
+
+/**
+ * Loads settings from EEPROM. If version mismatch, loads defaults.
+ */
+void loadSettings() {
+  EEPROM.get(SETTINGS_ADDR, g_settings);
+  if (g_settings.version != SETTINGS_VERSION) {
+    // Version mismatch or uninitialized, load defaults
+    g_settings = {SETTINGS_VERSION, 0, 0, 0, 25.0, 18.0, false, 25.0};
+    EEPROM.put(SETTINGS_ADDR, g_settings);
+  }
+  // Apply loaded settings to control variables
+  coolSpeed = g_settings.coolSpeed;
+  heatSpeed = g_settings.heatSpeed;
+  growLevel = g_settings.growLevel;
+  autoMode = g_settings.autoMode;
+  g_tempSetpoint = g_settings.tempSetpoint;
+}
+
+/**
+ * Saves current settings to EEPROM.
+ */
+void saveSettings() {
+  g_settings.version = SETTINGS_VERSION;
+  g_settings.coolSpeed = coolSpeed;
+  g_settings.heatSpeed = heatSpeed;
+  g_settings.growLevel = growLevel;
+  g_settings.autoMode = autoMode;
+  g_settings.tempSetpoint = g_tempSetpoint;
+  EEPROM.put(SETTINGS_ADDR, g_settings);
+}
+
+/**
+ * Resets settings to factory defaults and saves to EEPROM.
+ */
+void resetSettings() {
+  g_settings = {SETTINGS_VERSION, 0, 0, 0, 25.0, 18.0, false, 25.0};
+  EEPROM.put(SETTINGS_ADDR, g_settings);
+  coolSpeed = g_settings.coolSpeed;
+  heatSpeed = g_settings.heatSpeed;
+  growLevel = g_settings.growLevel;
+  autoMode = g_settings.autoMode;
+  g_tempSetpoint = g_settings.tempSetpoint;
+}
